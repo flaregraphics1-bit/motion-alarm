@@ -1,0 +1,209 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Motion Alarm">
+<meta name="theme-color" content="#000000">
+<title>Motion Alarm</title>
+<style>
+  :root { color-scheme: dark; --panel: rgba(0,0,0,.6); --green: #1faa59; --red: #e0322f; --fg: #fff; --dim: rgba(255,255,255,.75); }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { height: 100%; margin: 0; background: #000; color: var(--fg);
+    font: 16px/1.4 -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif; overflow: hidden;
+    -webkit-user-select: none; user-select: none; }
+  [hidden] { display: none !important; }
+  video { position: fixed; inset: 0; width: 100%; height: 100%; object-fit: cover; background: #000; }
+  #flash { position: fixed; inset: 0; background: var(--red); opacity: 0; pointer-events: none; }
+  body.alarm #flash { animation: flash .5s steps(2, jump-none) infinite; }
+  @keyframes flash { from { opacity: .15; } to { opacity: .6; } }
+  #ui { position: fixed; inset: 0; display: flex; flex-direction: column; justify-content: space-between; gap: 16px;
+    padding: calc(env(safe-area-inset-top, 0px) + 16px) 16px calc(env(safe-area-inset-bottom, 0px) + 16px); }
+  .panel { background: var(--panel); border-radius: 16px; padding: 14px 16px;
+    -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px); }
+  #status { font-size: 22px; font-weight: 700; text-align: center; margin: 0 0 10px; }
+  #meter { height: 8px; border-radius: 4px; background: rgba(255,255,255,.2); overflow: hidden; }
+  #meterFill { height: 100%; width: 0%; background: var(--green); transition: width .1s linear; }
+  #bottom { display: flex; flex-direction: column; gap: 12px; }
+  label { display: block; font-size: 14px; margin-bottom: 6px; }
+  input[type=range] { width: 100%; accent-color: var(--green); }
+  .hint { font-size: 12px; color: var(--dim); margin: 6px 0 0; }
+  .row { display: flex; gap: 12px; }
+  button { font: inherit; color: var(--fg); border: 0; border-radius: 14px; padding: 18px; font-weight: 700; font-size: 19px; }
+  #main { flex: 1; background: var(--green); }
+  #main.stop { background: var(--red); }
+  #flip { background: var(--panel); font-size: 15px; padding: 18px 16px; }
+  #start { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 16px; padding: 24px; background: #000; text-align: center; }
+  #start h1 { margin: 0; font-size: 28px; }
+  #start p { margin: 0; color: var(--dim); max-width: 30em; }
+  #startBtn { background: var(--green); padding: 18px 40px; }
+  #err { color: #ff8a80; }
+</style>
+</head>
+<body>
+<video id="video" playsinline muted autoplay></video>
+<div id="flash"></div>
+
+<div id="ui" hidden>
+  <div class="panel">
+    <p id="status">Ready</p>
+    <div id="meter"><div id="meterFill"></div></div>
+  </div>
+  <div id="bottom">
+    <div class="panel" id="sensPanel">
+      <label for="sens">Sensitivity</label>
+      <input id="sens" type="range" min="0" max="1" step="0.01" value="0.5">
+      <p class="hint">Move in front of the camera and watch the bar at the top to test.</p>
+    </div>
+    <div class="row">
+      <button id="main">Arm</button>
+      <button id="flip">Flip camera</button>
+    </div>
+  </div>
+</div>
+
+<div id="start">
+  <h1>Motion Alarm</h1>
+  <p>Turn your volume all the way up, prop the phone so the camera sees the area, and keep it plugged in with this screen open.</p>
+  <button id="startBtn">Start camera</button>
+  <p id="err"></p>
+</div>
+
+<script>
+(function () {
+  var GRID_W = 48, GRID_H = 36, PIXEL_DELTA = 28, COUNTDOWN = 10;
+  var $ = function (id) { return document.getElementById(id); };
+  var video = $('video'), statusEl = $('status'), fill = $('meterFill'), mainBtn = $('main');
+  var canvas = document.createElement('canvas'); canvas.width = GRID_W; canvas.height = GRID_H;
+  var ctx2d = canvas.getContext('2d', { willReadFrequently: true });
+
+  var phase = 'idle';            // idle | countdown | armed | alarm
+  var facing = 'environment';
+  var stream = null, prev = null, consecutive = 0, warmup = 0, countdownTimer = null;
+  var audio = null, siren = null, wakeLock = null;
+
+  // ---------- camera ----------
+  function startCamera() {
+    if (stream) stream.getTracks().forEach(function (t) { t.stop(); });
+    return navigator.mediaDevices.getUserMedia({
+      audio: false,
+      video: { facingMode: facing, width: { ideal: 640 }, height: { ideal: 480 } }
+    }).then(function (s) {
+      stream = s; video.srcObject = s; prev = null;
+      return video.play();
+    });
+  }
+
+  // ---------- sound ----------
+  function unlockAudio() {
+    try { if (navigator.audioSession) navigator.audioSession.type = 'playback'; } catch (e) {}  // play even on silent
+    if (!audio) { var AC = window.AudioContext || window.webkitAudioContext; audio = new AC(); }
+    if (audio.state !== 'running') audio.resume();
+  }
+  function startSiren() {
+    if (siren || !audio) return;
+    if (audio.state !== 'running') audio.resume();
+    var osc = audio.createOscillator(), osc2 = audio.createOscillator();
+    var lfo = audio.createOscillator(), lfoGain = audio.createGain(), out = audio.createGain();
+    osc.type = 'square'; osc.frequency.value = 1100;
+    osc2.type = 'sawtooth'; osc2.frequency.value = 1100;
+    lfo.type = 'sine'; lfo.frequency.value = 1.5; lfoGain.gain.value = 400;   // sweep 700-1500 Hz
+    lfo.connect(lfoGain); lfoGain.connect(osc.frequency); lfoGain.connect(osc2.frequency);
+    out.gain.value = 0.9;
+    osc.connect(out); osc2.connect(out); out.connect(audio.destination);
+    osc.start(); osc2.start(); lfo.start();
+    siren = [osc, osc2, lfo, out];
+  }
+  function stopSiren() {
+    if (!siren) return;
+    siren.slice(0, 3).forEach(function (n) { try { n.stop(); } catch (e) {} });
+    siren[3].disconnect(); siren = null;
+  }
+
+  // ---------- keep screen awake ----------
+  function keepAwake() {
+    if (!('wakeLock' in navigator)) return;
+    navigator.wakeLock.request('screen').then(function (l) { wakeLock = l; }).catch(function () {});
+  }
+  document.addEventListener('visibilitychange', function () {
+    if (document.visibilityState === 'visible' && !$('ui').hidden) { keepAwake(); if (video.paused) video.play().catch(function () {}); }
+  });
+
+  // ---------- motion detection ----------
+  function triggerRatio() { return 0.15 - parseFloat($('sens').value) * 0.145; }
+
+  function tick() {
+    if (!stream || video.readyState < 2) return;
+    ctx2d.drawImage(video, 0, 0, GRID_W, GRID_H);
+    var d = ctx2d.getImageData(0, 0, GRID_W, GRID_H).data;
+    var n = GRID_W * GRID_H, grid = new Uint8Array(n);
+    for (var i = 0; i < n; i++) grid[i] = (d[i * 4] * 299 + d[i * 4 + 1] * 587 + d[i * 4 + 2] * 114) / 1000;
+    var last = prev; prev = grid;
+    if (!last) return;
+
+    var changed = 0;
+    for (var j = 0; j < n; j++) if (Math.abs(grid[j] - last[j]) > PIXEL_DELTA) changed++;
+    var ratio = changed / n;
+    var level = Math.min(1, ratio / 0.25);
+    fill.style.width = (level * 100) + '%';
+    fill.style.background = ratio > triggerRatio() ? 'var(--red)' : 'var(--green)';
+
+    if (phase !== 'armed') return;
+    if (warmup > 0) { warmup--; return; }
+    consecutive = ratio > triggerRatio() ? consecutive + 1 : 0;
+    if (consecutive >= 2) { consecutive = 0; setPhase('alarm'); startSiren(); }
+  }
+
+  // ---------- state ----------
+  function setPhase(p, n) {
+    phase = p;
+    document.body.classList.toggle('alarm', p === 'alarm');
+    $('sensPanel').hidden = p !== 'idle';
+    $('flip').hidden = p !== 'idle';
+    mainBtn.classList.toggle('stop', p !== 'idle');
+    mainBtn.textContent = p === 'idle' ? 'Arm' : p === 'alarm' ? 'Stop alarm' : 'Cancel';
+    statusEl.textContent = p === 'idle' ? 'Ready' : p === 'countdown' ? 'Arming in ' + n + '…'
+      : p === 'armed' ? 'ARMED – watching' : 'MOTION DETECTED!';
+  }
+  function arm() {
+    unlockAudio(); keepAwake();
+    var n = COUNTDOWN; setPhase('countdown', n);
+    countdownTimer = setInterval(function () {
+      n--;
+      if (n > 0) { setPhase('countdown', n); return; }
+      clearInterval(countdownTimer); countdownTimer = null;
+      consecutive = 0; warmup = 10; setPhase('armed');
+    }, 1000);
+  }
+  function disarm() {
+    if (countdownTimer) { clearInterval(countdownTimer); countdownTimer = null; }
+    stopSiren(); setPhase('idle');
+  }
+
+  // ---------- wiring ----------
+  mainBtn.addEventListener('click', function () { phase === 'idle' ? arm() : disarm(); });
+  $('flip').addEventListener('click', function () {
+    facing = facing === 'environment' ? 'user' : 'environment';
+    startCamera().catch(function () {});
+  });
+  $('startBtn').addEventListener('click', function () {
+    unlockAudio();
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      $('err').textContent = 'Camera is not available here. Open this page in Safari from its https:// link.'; return;
+    }
+    startCamera().then(function () {
+      $('start').hidden = true; $('ui').hidden = false; keepAwake();
+      setInterval(tick, 100);
+    }).catch(function (e) {
+      $('err').textContent = 'Could not open the camera (' + (e && e.name || 'error') +
+        '). Allow camera access when Safari asks, or check Settings > Apps > Safari > Camera.';
+    });
+  });
+})();
+</script>
+</body>
+</html>
